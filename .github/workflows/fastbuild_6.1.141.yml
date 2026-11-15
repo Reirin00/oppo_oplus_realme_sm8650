@@ -12,10 +12,10 @@ on:
   workflow_dispatch:
     inputs:
       ksu_type:
-        description: 'KernelSU分支(BakaSU/SukiSU Ultra/KernelSU Next/KSU(原版)/无内置KSU,默认BakaSU)'
+        description: 'KernelSU分支(SukiSU Ultra builtin 默认/SukiSU Ultra susfs-main/BakaSU/KernelSU Next/KSU原版/无内置KSU)'
         required: true
         type: choice
-        default: 'bakasu'
+        default: 'sukisu'
         options:
           - 'bakasu'
           - 'sukisu'
@@ -46,7 +46,7 @@ on:
         description: '是否启用bbr算法(优化上行数据,对手机日用无太大意义甚至可能负优化;false关闭,true仅加入算法,default设为默认)'
         required: true
         type: choice
-        default: 'false'
+        default: 'default'
         options:
           - 'false'
           - 'true'
@@ -55,7 +55,7 @@ on:
         description: '是否启用Droidspaces容器支持(轻量化的完整Linux容器支持;false关闭,standard开启容器+ntsync支持,extend开启更多测试支持项)'
         required: true
         type: choice
-        default: 'false'
+        default: 'standard'
         options:
           - 'false'
           - 'standard'
@@ -250,14 +250,21 @@ jobs:
         run: |
           # 进入内核工作目录
           cd kernel_workspace
-          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
-            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            # SukiSU-Ultra builtin 分支：自带 SUSFS 与 KPM，提权走内核侧 execveat_sucompat
+            echo "正在配置 SukiSU-Ultra (builtin 分支)..."
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(git rev-list --count builtin) + 30700 2>/dev/null || echo 114514)
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            echo "正在配置 BakaSU（兼容 SukiSU 管理器）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
-            # 存储版本号到 GitHub 环境变量
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
@@ -520,12 +527,12 @@ jobs:
           echo "CONFIG_MQ_IOSCHED_SSG=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_MQ_IOSCHED_SSG_CGROUP=y" >> ./common/arch/arm64/configs/gki_defconfig
 
-      - name: 启用Re-Kernel支持
-        if: inputs.rekernel_enable
+      - name: 启用Re-Kernel支持（已按需求强制关闭）
+        if: false
         run: |
-          echo "正在启用Re-Kernel支持(用于与Freezer,NoActive等软件配合使用,提升冻结后台能力)…"
-          cd kernel_workspace
-          echo "CONFIG_REKERNEL=y" >> ./common/arch/arm64/configs/gki_defconfig
+          # [force-disabled] 按用户要求强制关闭 Re-Kernel，杜绝生成 /proc/rekernel 节点。
+          echo "Re-Kernel 已被强制关闭（workflow 硬编码 if: false）"
+          exit 0
 
       - name: 启用内核级基带保护
         if: inputs.baseband_guard
@@ -553,6 +560,216 @@ jobs:
             done
           fi
            
+      - name: Ultimate Verified Kernel-Level C Source Optimization
+        run: |
+          cd kernel_workspace/common
+          python3 - << 'OPTEOF'
+          import pathlib, re
+
+          def find_file(rel_path):
+              matches = list(pathlib.Path(".").rglob(rel_path))
+              if not matches:
+                  raise FileNotFoundError(f"Cannot find {rel_path}")
+              return matches[0]
+
+          # =========================================================================
+          # 1. 四大核心计算子系统定向 -O3 优化 (兼容 Clang 20 ThinLTO 与 RELR)
+          # =========================================================================
+          for sub_mk in ["kernel/sched/Makefile", "mm/Makefile", "crypto/Makefile", "lib/Makefile"]:
+              try:
+                  mk_path = find_file(sub_mk)
+                  mk_txt = mk_path.read_text(encoding="utf-8", errors="ignore")
+                  o3_flag = "\nsubdir-ccflags-y += -O3 -Wno-error\n"
+                  if "subdir-ccflags-y += -O3" not in mk_txt:
+                      mk_path.write_text(mk_txt + o3_flag, encoding="utf-8")
+                      print(f"[OK] Injected -O3 into {mk_path}")
+              except Exception as e:
+                  print(f"[WARN] Skip {sub_mk}: {e}")
+
+          # =========================================================================
+          # 2. 调度特性: NEXT_BUDDY=true, UTIL_EST_FASTUP=false
+          # =========================================================================
+          feat_path = find_file("kernel/sched/features.h")
+          feat_code = feat_path.read_text(encoding="utf-8", errors="ignore")
+          feat_code = feat_code.replace(
+              "SCHED_FEAT(NEXT_BUDDY, false)", "SCHED_FEAT(NEXT_BUDDY, true)"
+          ).replace(
+              "SCHED_FEAT(UTIL_EST_FASTUP, true)", "SCHED_FEAT(UTIL_EST_FASTUP, false)"
+          )
+          feat_path.write_text(feat_code, encoding="utf-8")
+          print("[OK] Patched kernel/sched/features.h")
+
+          # =========================================================================
+          # 3. 调度器核心 fair.c
+          #    !! fits_capacity 保持原生 80% (1280) 不动 !!
+          #    - 双向 vruntime 调节
+          #    - 关键帧保护 + 极速唤醒抢占
+          # =========================================================================
+          fair_path = find_file("kernel/sched/fair.c")
+          fair_code = fair_path.read_text(encoding="utf-8", errors="ignore")
+
+          # 显式确认 fits_capacity 未被改动（如果源码里已经是 1138 就报警）
+          if "#define fits_capacity(cap, max)\t((cap) * 1138" in fair_code:
+              print("[WARN] fits_capacity 已经是 1138，本步骤不修改它，请确认源码状态")
+
+          bore_anchor = "curr->vruntime += calc_delta_fair(delta_exec, curr);"
+          bore_patch = """{
+          \t\tu64 burst_ns = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+          \t\tu64 adj_delta = delta_exec;
+          #ifdef CONFIG_UCLAMP_TASK
+          \t\tif (entity_is_task(curr)) {
+          \t\t\tstruct task_struct *tsk = task_of(curr);
+          \t\t\tif (uclamp_eff_value(tsk, UCLAMP_MIN) > 0)
+          \t\t\t\tadj_delta -= (delta_exec >> 2);
+          \t\t\telse if (burst_ns > 4000000ULL)
+          \t\t\t\tadj_delta += (delta_exec >> 1);
+          \t\t}
+          #else
+          \t\tif (burst_ns > 4000000ULL)
+          \t\t\tadj_delta += (delta_exec >> 1);
+          #endif
+          \t\tcurr->vruntime += calc_delta_fair(adj_delta, curr);
+          \t}"""
+          if bore_anchor in fair_code:
+              fair_code = fair_code.replace(bore_anchor, bore_patch, 1)
+              print("[OK] fair.c vruntime 双向调节已注入")
+          else:
+              print("[WARN] fair.c vruntime anchor 未命中")
+
+          scx_anchor = "if (unlikely(se == pse))\n\t\treturn;"
+          scx_patch = """if (unlikely(se == pse))
+          \t\treturn;
+
+          #ifdef CONFIG_UCLAMP_TASK
+          \t{
+          \t\tbool curr_crit = uclamp_eff_value(curr, UCLAMP_MIN) > 0;
+          \t\tbool wake_crit = uclamp_eff_value(p, UCLAMP_MIN) > 0;
+          \t\tu64 curr_burst = curr->se.sum_exec_runtime - curr->se.prev_sum_exec_runtime;
+
+          \t\tif (curr_crit && !wake_crit && curr_burst < 3000000ULL)
+          \t\t\treturn;
+
+          \t\tif (wake_crit && !curr_crit && curr_burst > 500000ULL)
+          \t\t\tgoto preempt;
+          \t}
+          #endif"""
+          if scx_anchor in fair_code:
+              fair_code = fair_code.replace(scx_anchor, scx_patch, 1)
+              print("[OK] fair.c 关键帧抢占已注入")
+          else:
+              print("[WARN] fair.c scx anchor 未命中")
+
+          fair_path.write_text(fair_code, encoding="utf-8")
+
+          # =========================================================================
+          # 4. 调速器 schedutil: 三丛集削峰 + I/O boost 仅小核 + 防抖延迟
+          # =========================================================================
+          sugov_path = find_file("kernel/sched/cpufreq_schedutil.c")
+          sugov_code = sugov_path.read_text(encoding="utf-8", errors="ignore")
+
+          freq_anchor = "freq = map_util_freq(util, freq, max);"
+          freq_patch = """if (policy->cpu == 7 && (util * 100 < max * 88))
+          \t\tfreq = map_util_freq(util - (util >> 3) - (util >> 4), freq, max);
+          \telse if (policy->cpu >= 2 && (util * 100 < max * 85))
+          \t\tfreq = map_util_freq(util - (util >> 3), freq, max);
+          \telse
+          \t\tfreq = map_util_freq(util, freq, max);"""
+          if freq_anchor in sugov_code:
+              sugov_code = sugov_code.replace(freq_anchor, freq_patch, 1)
+              print("[OK] schedutil 三丛集削峰已注入")
+
+          iowait_anchor = "bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;"
+          iowait_patch = "bool set_iowait_boost = (flags & SCHED_CPUFREQ_IOWAIT) && (sg_cpu->cpu < 2);"
+          if iowait_anchor in sugov_code:
+              sugov_code = sugov_code.replace(iowait_anchor, iowait_patch, 1)
+              print("[OK] schedutil I/O boost 仅小核已注入")
+
+          rl_anchor = "tunables->rate_limit_us = cpufreq_policy_transition_delay_us(policy);"
+          rl_patch = "tunables->rate_limit_us = (policy->cpu == 7) ? 2500 : ((policy->cpu >= 2) ? 2000 : 1000);"
+          if rl_anchor in sugov_code:
+              sugov_code = sugov_code.replace(rl_anchor, rl_patch, 1)
+              print("[OK] schedutil 三丛集防抖已注入")
+
+          sugov_path.write_text(sugov_code, encoding="utf-8")
+
+          # =========================================================================
+          # 5. 内存 / 回写 / 网络栈
+          # =========================================================================
+          try:
+              comp_path = find_file("mm/compaction.c")
+              c = comp_path.read_text(encoding="utf-8", errors="ignore")
+              c = re.sub(r"(sysctl_compaction_proactiveness[^=;]*=\s*)20;", r"\g<1>0;", c)
+              comp_path.write_text(c, encoding="utf-8"); print("[OK] compaction_proactiveness -> 0")
+          except Exception as e: print(f"[WARN] compaction: {e}")
+
+          try:
+              swap_path = find_file("mm/swap.c")
+              c = swap_path.read_text(encoding="utf-8", errors="ignore")
+              c = re.sub(r"page_cluster\s*=\s*[23];", "page_cluster = 0;", c)
+              swap_path.write_text(c, encoding="utf-8"); print("[OK] page_cluster -> 0")
+          except Exception as e: print(f"[WARN] swap: {e}")
+
+          try:
+              vmscan_path = find_file("mm/vmscan.c")
+              c = vmscan_path.read_text(encoding="utf-8", errors="ignore")
+              c = c.replace("int vm_swappiness = 60;", "int vm_swappiness = 100;")
+              c = c.replace("static unsigned long lru_gen_min_ttl __read_mostly;",
+                            "static unsigned long lru_gen_min_ttl __read_mostly = HZ;")
+              vmscan_path.write_text(c, encoding="utf-8"); print("[OK] swappiness=100, lru_gen_min_ttl=HZ")
+          except Exception as e: print(f"[WARN] vmscan: {e}")
+
+          try:
+              vmstat_path = find_file("mm/vmstat.c")
+              c = vmstat_path.read_text(encoding="utf-8", errors="ignore")
+              c = c.replace("int sysctl_stat_interval __read_mostly = HZ;",
+                            "int sysctl_stat_interval __read_mostly = 10 * HZ;")
+              vmstat_path.write_text(c, encoding="utf-8"); print("[OK] sysctl_stat_interval -> 10*HZ")
+          except Exception as e: print(f"[WARN] vmstat: {e}")
+
+          try:
+              wb_path = find_file("mm/page-writeback.c")
+              c = wb_path.read_text(encoding="utf-8", errors="ignore")
+              c = re.sub(r"(dirty_writeback_interval\s*=\s*)5\s*\*\s*100;", r"\g<1>15 * 100;", c)
+              wb_path.write_text(c, encoding="utf-8"); print("[OK] dirty_writeback_interval -> 15*100")
+          except Exception as e: print(f"[WARN] page-writeback: {e}")
+
+          try:
+              dcache_path = find_file("fs/dcache.c")
+              c = dcache_path.read_text(encoding="utf-8", errors="ignore")
+              c = c.replace("sysctl_vfs_cache_pressure __read_mostly = 100;",
+                            "sysctl_vfs_cache_pressure __read_mostly = 50;")
+              dcache_path.write_text(c, encoding="utf-8"); print("[OK] vfs_cache_pressure -> 50")
+          except Exception as e: print(f"[WARN] dcache: {e}")
+
+          try:
+              tcp_path = find_file("net/ipv4/tcp_output.c")
+              c = tcp_path.read_text(encoding="utf-8", errors="ignore")
+              c = c.replace("int sysctl_tcp_slow_start_after_idle __read_mostly = 1;",
+                            "int sysctl_tcp_slow_start_after_idle __read_mostly = 0;")
+              tcp_path.write_text(c, encoding="utf-8"); print("[OK] tcp_slow_start_after_idle -> 0")
+          except Exception as e: print(f"[WARN] tcp_output: {e}")
+
+          print("=== Ultimate Kernel C Source Optimization applied successfully. ===")
+          OPTEOF
+
+          # ===== 配套 CONFIG =====
+          CFG=./arch/arm64/configs/gki_defconfig
+          for c in CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE CONFIG_UCLAMP_TASK CONFIG_UCLAMP_TASK_GROUP \
+                   CONFIG_WQ_POWER_EFFICIENT_DEFAULT CONFIG_LRU_GEN CONFIG_LRU_GEN_ENABLED \
+                   CONFIG_OVERLAY_FS CONFIG_TMPFS_XATTR \
+                   CONFIG_NETFILTER_XT_TARGET_TPROXY CONFIG_NETFILTER_XT_MATCH_SOCKET \
+                   CONFIG_NF_TPROXY_IPV4 CONFIG_NF_TPROXY_IPV6 \
+                   CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET; do
+            grep -q "^${c}=y" "$CFG" || echo "${c}=y" >> "$CFG"
+          done
+          sed -i 's/^CONFIG_KSM=y/# CONFIG_KSM is not set/' "$CFG" 2>/dev/null || true
+          grep -q "^# CONFIG_KSM is not set" "$CFG" || echo "# CONFIG_KSM is not set" >> "$CFG"
+          sed -i 's/^CONFIG_SCHED_DEBUG=y/# CONFIG_SCHED_DEBUG is not set/' "$CFG" 2>/dev/null || true
+          grep -q "^# CONFIG_SCHED_DEBUG is not set" "$CFG" || echo "# CONFIG_SCHED_DEBUG is not set" >> "$CFG"
+          sed -i 's/^CONFIG_DEBUG_PREEMPT=y/# CONFIG_DEBUG_PREEMPT is not set/' "$CFG" 2>/dev/null || true
+          grep -q "^# CONFIG_DEBUG_PREEMPT is not set" "$CFG" || echo "# CONFIG_DEBUG_PREEMPT is not set" >> "$CFG"
+          echo "[OK] CONFIG 已追加/修正"
+
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"

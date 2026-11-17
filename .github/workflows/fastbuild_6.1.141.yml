@@ -315,14 +315,21 @@ jobs:
               printf '%s\n' \
                 "" \
                 "/* ==== SukiSU-Nova compatibility stubs ==== */" \
-                "struct selinux_state fake_state;" \
-                "" \
                 "int susfs_add_sus_type(const char *secctx, u32 type_value) { return 0; }" \
                 "EXPORT_SYMBOL(susfs_add_sus_type);" \
                 "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed) { return 0; }" \
                 "EXPORT_SYMBOL(susfs_add_sus_avd_allowed_by_type);" \
                 >> ./fs/susfs.c
-              echo "[OK] 已补 Nova 兼容 stub: fake_state / susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type"
+              # fake_state 必须在有 struct selinux_state 完整定义的文件里 —— security/selinux/selinuxfs.c
+              if ! grep -q "^struct selinux_state fake_state;" ./security/selinux/selinuxfs.c 2>/dev/null; then
+                printf '%s\n' \
+                  "" \
+                  "/* ==== SukiSU-Nova compatibility: selinux_state instance for susfs ==== */" \
+                  "struct selinux_state fake_state;" \
+                  >> ./security/selinux/selinuxfs.c
+                echo "[OK] fake_state 已定义在 selinuxfs.c"
+              fi
+              echo "[OK] 已补 Nova 兼容 stub: susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type / fake_state"
             else
               echo "[OK] Nova 兼容 stub 已存在"
             fi

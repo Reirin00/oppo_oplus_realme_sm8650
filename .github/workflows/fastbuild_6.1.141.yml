@@ -311,7 +311,7 @@ jobs:
             # ===== SukiSU-Nova compat stub =====
             # Nova 新增 3 个 susfs 符号，susfs4oki 完全没有，不补会 ld.lld undefined symbol：
             #   susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type / fake_state
-            if ! grep -q "susfs_add_sus_type(const char" ./common/fs/susfs.c 2>/dev/null; then
+            if ! grep -q "susfs_add_sus_type(const char" ./fs/susfs.c 2>/dev/null; then
               printf '%s\n' \
                 "" \
                 "/* ==== SukiSU-Nova compatibility stubs ==== */" \
@@ -321,7 +321,7 @@ jobs:
                 "EXPORT_SYMBOL(susfs_add_sus_type);" \
                 "int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed) { return 0; }" \
                 "EXPORT_SYMBOL(susfs_add_sus_avd_allowed_by_type);" \
-                >> ./common/fs/susfs.c
+                >> ./fs/susfs.c
               echo "[OK] 已补 Nova 兼容 stub: fake_state / susfs_add_sus_type / susfs_add_sus_avd_allowed_by_type"
             else
               echo "[OK] Nova 兼容 stub 已存在"

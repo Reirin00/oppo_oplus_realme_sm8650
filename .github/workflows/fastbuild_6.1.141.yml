@@ -872,6 +872,27 @@ jobs:
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
+          # ============================================================
+          # [ace5-fix] 生成 out/usr/include —— SukiSU-Nova 的 preinit 模块硬依赖它
+          # Nova 的 drivers/kernelsu/Makefile 第 25 行用
+          #   ifneq ($(wildcard $(objtree)/usr/include/linux/unistd.h),)
+          # 判断是否把 preinit/preinit.o + preinit/blob.o 编进 ksu.o，
+          # 否则定义 -DKSU_NO_PREINIT 并跳过。但那个宏只在 KSU 自己的
+          # Makefile 里生效，而 fs/exec.c 是由内核主 Makefile 编译的，
+          # 收不到 -DKSU_NO_PREINIT —— 于是 50 号 SUSFS 补丁插进 exec.c 的
+          #   ksu_setup_preinit_file() / ksu_preinit_handle_post_execveat()
+          # 两个调用被无条件编进去，最终 ld.lld 报 undefined symbol（#6 的失败原因）。
+          # 只要 usr/include 存在，preinit.o 就会被编进来，符号自然有了。
+          # ============================================================
+          echo "=== [ace5-fix] 生成 user UAPI headers（供 KernelSU preinit 模块使用）==="
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_HDR_PATH="$(pwd)/out/usr" headers_install || \
+            echo "[WARN] headers_install 失败，继续构建（preinit 将被禁用）"
+          if [ -f out/usr/include/linux/unistd.h ]; then
+            echo "[OK] out/usr/include/linux/unistd.h 已就位 → preinit 模块会被编译"
+            ls -la out/usr/include/linux/unistd.h
+          else
+            echo "[WARN] out/usr/include/linux/unistd.h 仍不存在 → preinit 会被禁用"
+          fi &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
           # 编译后时间劫持二次校验

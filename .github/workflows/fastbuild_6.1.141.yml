@@ -885,13 +885,21 @@ jobs:
           # 只要 usr/include 存在，preinit.o 就会被编进来，符号自然有了。
           # ============================================================
           echo "=== [ace5-fix] 生成 user UAPI headers（供 KernelSU preinit 模块使用）==="
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- INSTALL_HDR_PATH="$(pwd)/out/usr" headers_install || \
+          # 必须带 O=out：INSTALL_HDR_PATH 默认就是 $(objtree)/usr，而 objtree 只由 O= 决定。
+          # 不传 O= 时 objtree 指向源树，headers 目标的 scripts_unifdef / version_h
+          # 会把 include/generated/* 写进源树 → 下一次 make 直接报
+          # "The source tree is not clean, please run 'make ARCH=arm64 mrproper'"（#7 的失败原因）。
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out headers_install || \
             echo "[WARN] headers_install 失败，继续构建（preinit 将被禁用）"
           if [ -f out/usr/include/linux/unistd.h ]; then
             echo "[OK] out/usr/include/linux/unistd.h 已就位 → preinit 模块会被编译"
             ls -la out/usr/include/linux/unistd.h
           else
             echo "[WARN] out/usr/include/linux/unistd.h 仍不存在 → preinit 会被禁用"
+          fi
+          # 自检：确认 headers_install 没有把源树弄脏
+          if [ -n "$(git -C . status --porcelain --untracked-files=no 2>/dev/null | head -1)" ]; then
+            echo "[WARN] 源树仍有改动（编译前补丁造成的，正常）"
           fi &&
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
